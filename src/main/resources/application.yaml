@@ -15,7 +15,12 @@ spring:
 
     
 server:
-    port: 8444
+    port: 8443
+    ssl:
+      enabled: true
+      key-store: classpath:keystore.p12 
+      key-store-password: password
+      key-store-type: PKCS12
 
 security:
   jwt:

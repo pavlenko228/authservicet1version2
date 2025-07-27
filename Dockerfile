@@ -4,6 +4,6 @@ WORKDIR /app
 
 COPY target/authservice.jar authservice.jar
 
-EXPOSE 8444
+EXPOSE 8443
 
 ENTRYPOINT ["java", "-jar", "authservice.jar"]

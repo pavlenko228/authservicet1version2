@@ -1,5 +1,6 @@
 package com.t1.authservice.service.impl;
 
+import java.text.ParseException;
 import java.util.List;
 import java.util.Optional;
 
@@ -22,7 +23,8 @@ import com.t1.authservice.exception.SuchUserExistsException;
 import com.t1.authservice.repository.TokenRepository;
 import com.t1.authservice.repository.UserRepository;
 import com.t1.authservice.service.contract.AuthenticationService;
-import com.t1.authservice.service.contract.JwtService;
+import com.t1.authservice.service.contract.JweService;
+import com.t1.authservice.service.contract.TokenAllowlistService;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -33,125 +35,106 @@ import lombok.RequiredArgsConstructor;
 public class AuthenticationServiceImpl implements AuthenticationService {
 
     private final UserRepository userRepository;
-
     private final TokenRepository tokenRepository;
-
-    private final JwtService jwtService;
-
+    private final JweService jweService;
+    private final TokenAllowlistService tokenAllowlistService;
     private final PasswordEncoder passwordEncoder;
-
     private final AuthenticationManager authenticationManager;
-    
+
+    @Override
     public AuthenticationResponse register(RegistrationRequest registrationRequest, HttpServletResponse response) {
-        User user = User.builder()
-                        .id(null)
-                        .login(registrationRequest.getLogin())
-                        .email(registrationRequest.getEmail())
-                        .password(passwordEncoder.encode(registrationRequest.getPassword()))  
-                        .role(Role.ROLE_PREMIUM_USER)
-                        .build();
-
-        if (!userRepository.existsByEmail(user.getEmail())) { 
-
-            userRepository.save(user); 
-
-            String accessToken = jwtService.generateAccessToken(user); 
-            String refreshToken = jwtService.generateRefreshToken(user);
-
-            saveUserToken(accessToken, refreshToken, user);  
-
-            response.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
-            response.setHeader("X-Refresh-Token", refreshToken);
-        
-            return new AuthenticationResponse(accessToken, refreshToken);
+        if (userRepository.existsByEmail(registrationRequest.getEmail())) {
+            throw new SuchUserExistsException("User with this email already exists");
         }
-        
-        throw new SuchUserExistsException("An user with such an email or phone number has already been created");
+
+        User user = User.builder()
+                .login(registrationRequest.getLogin())
+                .email(registrationRequest.getEmail())
+                .password(passwordEncoder.encode(registrationRequest.getPassword()))
+                .role(Role.ROLE_PREMIUM_USER)
+                .build();
+
+        userRepository.save(user);
+
+        return generateAndSaveTokens(user, response);
     }
 
+    @Override
     public AuthenticationResponse authenticate(LoginRequest loginRequest, HttpServletResponse response) {
         authenticationManager.authenticate(
-            new UsernamePasswordAuthenticationToken(
-                loginRequest.getEmail(),
-                loginRequest.getPassword()
-            )
-        ); 
-        
-        User user = userRepository.findByEmail(loginRequest.getEmail()).get(); 
+                new UsernamePasswordAuthenticationToken(
+                        loginRequest.getEmail(),
+                        loginRequest.getPassword()
+                )
+        );
 
-        String accessToken = jwtService.generateAccessToken(user); 
-        String refreshToken = jwtService.generateRefreshToken(user);
+        User user = userRepository.findByEmail(loginRequest.getEmail())
+                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
 
-        revokeAllToken(user); 
+        return generateAndSaveTokens(user, response);
+    }
+
+    @Override
+    public AuthenticationResponse refreshToken(HttpServletRequest request, HttpServletResponse response) throws ParseException {
+        String refreshToken = request.getHeader("X-Refresh-Token");
+        if (refreshToken == null) {
+            throw new MissingAuthorizationHeaderException("Refresh token missing");
+        }
+
+        String email = jweService.extractEmail(refreshToken);
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+
+        if (!jweService.isTokenValid(refreshToken, user)) {
+            throw new InvalidRefreshTokenException("Invalid refresh token");
+        }
+
+        return generateAndSaveTokens(user, response);
+    }
+
+    private AuthenticationResponse generateAndSaveTokens(User user, HttpServletResponse response) {
+        revokeAllUserTokens(user);
+
+        String accessToken = jweService.generateAccessToken(user);
+        String refreshToken = jweService.generateRefreshToken(user);
+
+        tokenAllowlistService.addToAllowlist(jweService.extractJti(accessToken));
+        tokenAllowlistService.addToAllowlist(jweService.extractJti(refreshToken));
 
         saveUserToken(accessToken, refreshToken, user);
 
         response.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
         response.setHeader("X-Refresh-Token", refreshToken);
+        response.setHeader("Access-Control-Expose-Headers", "Authorization, X-Refresh-Token");
 
         return new AuthenticationResponse(accessToken, refreshToken);
     }
 
-    public AuthenticationResponse refreshToken(HttpServletRequest request, HttpServletResponse response) throws MissingAuthorizationHeaderException {
-
-        String token = request.getHeader("X-Refresh-Token");
-
-        if (token == null) {
-            throw new MissingAuthorizationHeaderException("User unauthenticate");
-        }
-        
-        String email = jwtService.extractEmail(token);
-
-        User user = userRepository.findByEmail(email)
-            .orElseThrow(() -> new UsernameNotFoundException("User not found")); 
-
-        if (jwtService.isRefreshTokenValid(token, user)) {
-            
-            String accessToken = jwtService.generateAccessToken(user);
-            String refreshToken = jwtService.generateRefreshToken(user);
-
-            revokeAllToken(user);
-
-            saveUserToken(accessToken, refreshToken, user);
-
-            response.setHeader("Access-Control-Expose-Headers", "Authorization, X-Refresh-Token");
-            response.setHeader(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken);
-            response.setHeader("X-Refresh-Token", refreshToken);
-
-            return new AuthenticationResponse(accessToken, refreshToken);
-        }
-
-        throw new InvalidRefreshTokenException("Token is invalid");
-    }
-
+    @Override
     public void revokeAllToken(User user) {
         List<Token> validTokens = tokenRepository.findAllTokenByUser(user.getId());
-      
-        if (!validTokens.isEmpty()) {
-          validTokens.forEach(t -> t.setLoggedOut(true));
-        }
-        
+        validTokens.forEach(token -> {
+            token.setLoggedOut(true);
+            tokenAllowlistService.removeFromAllowlist(jweService.extractJti(token.getAccessToken()));
+            tokenAllowlistService.removeFromAllowlist(jweService.extractJti(token.getRefreshToken()));
+        });
         tokenRepository.saveAll(validTokens);
     }
 
+    @Override
     public void revokeAllTokenController(String email) {
-        Optional<User> user = userRepository.findByEmail(email);
-        if (!user.isPresent()) {
-            throw new SuchUserExistsException("An user with such an email not exists");
-        }
-
-        revokeAllToken(user.get());
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+        revokeAllToken(user);
     }
 
     public void saveUserToken(String accessToken, String refreshToken, User user) {
-        tokenRepository.save(
-            Token.builder()
+        Token token = Token.builder()
                 .accessToken(accessToken)
                 .refreshToken(refreshToken)
                 .loggedOut(false)
                 .user(user)
-                .build()
-        );
+                .build();
+        tokenRepository.save(token);
     }
-
 }

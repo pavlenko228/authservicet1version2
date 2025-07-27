@@ -1,5 +1,7 @@
 package com.t1.authservice.service.contract;
 
+import java.text.ParseException;
+
 import com.t1.authservice.domain.dto.AuthenticationResponse;
 import com.t1.authservice.domain.dto.LoginRequest;
 import com.t1.authservice.domain.dto.RegistrationRequest;
@@ -15,7 +17,7 @@ public interface AuthenticationService {
 
     AuthenticationResponse authenticate(LoginRequest loginRequest, HttpServletResponse response);
 
-    AuthenticationResponse refreshToken(HttpServletRequest request, HttpServletResponse response) throws MissingAuthorizationHeaderException;
+    AuthenticationResponse refreshToken(HttpServletRequest request, HttpServletResponse response) throws MissingAuthorizationHeaderException, ParseException;
 
     void revokeAllToken(User user);
 
